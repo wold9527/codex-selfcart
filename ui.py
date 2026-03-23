@@ -8,6 +8,7 @@ import os
 import sys
 import traceback
 import threading
+from datetime import datetime
 from collections import deque
 
 import streamlit as st
@@ -16,11 +17,33 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import Config, CardInfo, BillingInfo, CaptchaConfig
 from mail_provider import MailProvider
-from auth_flow import AuthFlow, AuthResult
+from auth_flow import AuthFlow, AuthResult, RegistrationRetryPolicy
 from payment_flow import PaymentFlow
 from logger import ResultStore
 from database import init_db
 from code_manager import validate_code, reserve_use, complete_use, update_execution, get_code_history, get_code_info
+from email_service_manager import (
+    list_email_services,
+    get_email_service,
+    get_default_email_service,
+    create_email_service,
+    update_email_service,
+    delete_email_service,
+    test_email_service,
+)
+from proxy_manager import (
+    list_proxies,
+    get_proxy,
+    get_default_proxy as get_default_proxy_config,
+    create_proxy,
+    create_proxy_from_url,
+    update_proxy,
+    delete_proxy,
+    set_default_proxy,
+    mark_proxy_used,
+    test_proxy,
+)
+from settings_store import get_setting, set_setting
 
 init_db()
 
@@ -35,6 +58,9 @@ except Exception:
     pass
 
 OUTPUT_DIR = "test_outputs"
+REG_SETTING_FLOW_ATTEMPTS = "registration.max_flow_attempts"
+REG_SETTING_OTP_ATTEMPTS = "registration.max_otp_attempts"
+REG_SETTING_SESSION_ATTEMPTS = "registration.max_session_attempts"
 
 
 def _sanitize_error(raw_error: str) -> str:
@@ -481,6 +507,710 @@ def init_logging():
     logging.getLogger("watchdog").setLevel(logging.WARNING)
 
 
+def _extract_mail_worker_config(service: dict) -> tuple[bool, str, dict]:
+    if not service:
+        return False, "邮箱服务不存在", {}
+    if service.get("service_type") != "mail_worker":
+        return False, f"暂不支持的服务类型: {service.get('service_type')}", {}
+    cfg = service.get("config") or {}
+    worker_domain = (cfg.get("worker_domain") or "").strip()
+    admin_token = (cfg.get("admin_token") or "").strip()
+    email_domain = (cfg.get("email_domain") or "").strip()
+    if not (worker_domain and admin_token and email_domain):
+        return False, "邮箱服务配置不完整", {}
+    return True, "", {
+        "worker_domain": worker_domain,
+        "admin_token": admin_token,
+        "email_domain": email_domain,
+    }
+
+
+def _int_setting(key: str, default: int, min_value: int, max_value: int) -> int:
+    try:
+        val = int(get_setting(key, default))
+    except Exception:
+        val = default
+    return max(min_value, min(max_value, val))
+
+
+def _get_registration_retry_defaults() -> tuple[int, int, int]:
+    flow = _int_setting(REG_SETTING_FLOW_ATTEMPTS, 2, 1, 5)
+    otp = _int_setting(REG_SETTING_OTP_ATTEMPTS, 2, 1, 5)
+    session = _int_setting(REG_SETTING_SESSION_ATTEMPTS, 3, 1, 8)
+    return flow, otp, session
+
+
+def datetime_now_compact() -> str:
+    return datetime.now().strftime("%Y%m%d%H%M%S")
+
+
+def _render_proxy_selector(
+    *,
+    key_prefix: str,
+    label: str = "代理",
+    placeholder: str = "http://127.0.0.1:7897",
+) -> tuple[str, int | None]:
+    enabled = list_proxies(enabled_only=True, include_secret=True)
+    default_proxy = get_default_proxy_config(enabled_only=True, include_secret=True)
+
+    options = ["不使用代理", "手动输入"]
+    id_map = {}
+    for p in enabled:
+        lb = f"#{p['id']} {p.get('name', '-')}" \
+             f" ({p.get('proxy_type', 'http')}://{p.get('proxy_host', '')}:{p.get('proxy_port', '')})"
+        options.append(lb)
+        id_map[lb] = p["id"]
+
+    default_idx = 0
+    if default_proxy:
+        for idx, opt in enumerate(options):
+            if id_map.get(opt) == default_proxy["id"]:
+                default_idx = idx
+                break
+
+    mode = st.selectbox(label, options, index=default_idx, key=f"{key_prefix}_proxy_mode")
+    if mode == "不使用代理":
+        return "", None
+    if mode == "手动输入":
+        manual = st.text_input(
+            "手动代理地址",
+            placeholder=placeholder,
+            key=f"{key_prefix}_proxy_manual",
+        ).strip()
+        return manual, None
+
+    proxy_id = id_map.get(mode)
+    proxy_cfg = get_proxy(proxy_id, include_secret=True) if proxy_id else None
+    return (proxy_cfg or {}).get("proxy_url", ""), proxy_id
+
+
+def _normalize_plan_type(raw_plan: str) -> str:
+    plan = (raw_plan or "").strip().lower()
+    if "team" in plan or "business" in plan or "enterprise" in plan:
+        return "Team"
+    if "plus" in plan or "pro" in plan:
+        return "Plus"
+    if "free" in plan or "basic" in plan:
+        return "Free"
+    return "Unknown"
+
+
+def _is_subscription_active(exec_status: str, result_data: dict) -> bool:
+    rd = result_data or {}
+    confirm_status = str(rd.get("confirm_status") or "").strip()
+    confirm_resp = rd.get("confirm_response")
+    error_msg = str(rd.get("error") or "")
+    run_success = bool(rd.get("success"))
+
+    if isinstance(confirm_resp, dict):
+        if bool(confirm_resp.get("success")):
+            return True
+        status = str(confirm_resp.get("status") or "").lower()
+        pi_status = str((confirm_resp.get("payment_intent") or {}).get("status") or "").lower()
+        if status in ("complete", "succeeded"):
+            return True
+        if pi_status in ("succeeded", "processing"):
+            return True
+        if status == "open" and pi_status == "succeeded":
+            return True
+
+    if confirm_status == "200" and not error_msg:
+        return True
+
+    has_confirm_signal = bool(confirm_status or confirm_resp)
+    if run_success and has_confirm_signal:
+        return True
+    if (exec_status or "").lower() == "success" and has_confirm_signal:
+        return True
+    return False
+
+
+def _build_account_records(history_rows: list[dict]) -> list[dict]:
+    grouped: dict[str, list[dict]] = {}
+    for r in history_rows:
+        raw_json = r.get("result_json")
+        if not raw_json:
+            continue
+        try:
+            rd = json.loads(raw_json)
+        except Exception:
+            continue
+        email = (rd.get("email") or r.get("email") or "").strip()
+        if not email:
+            continue
+        plan = _normalize_plan_type(r.get("plan_type") or rd.get("plan_type") or "")
+        subscribed = _is_subscription_active(r.get("status", ""), rd)
+        sub_label = plan if (subscribed and plan in ("Plus", "Team")) else ("已开通" if subscribed else "未开通")
+        item = {
+            "exec_id": r["id"],
+            "email": email,
+            "plan_type": plan,
+            "subscribed": subscribed,
+            "subscription_label": sub_label,
+            "created_at": r.get("created_at", "")[:19],
+            "exec_status": r.get("status", ""),
+            "error_msg": r.get("error_msg", "") or rd.get("error", ""),
+            "has_token": bool(rd.get("access_token")),
+            "access_token": rd.get("access_token", ""),
+            "session_token": rd.get("session_token", ""),
+            "device_id": rd.get("device_id", ""),
+            "_data": rd,
+        }
+        grouped.setdefault(email, []).append(item)
+
+    records = []
+    for email, rows in grouped.items():
+        rows.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        latest = rows[0]
+        subscribed_rows = [x for x in rows if x["subscribed"]]
+        picked = subscribed_rows[0] if subscribed_rows else latest
+        picked = dict(picked)
+        picked["run_count"] = len(rows)
+        picked["latest_status"] = latest["exec_status"]
+        picked["latest_error"] = latest["error_msg"]
+        records.append(picked)
+
+    records.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return records
+
+
+def _run_registration_once(
+    email_service_id: int,
+    proxy: str = "",
+    flow_attempts: int = 2,
+    otp_attempts: int = 2,
+    session_attempts: int = 3,
+) -> dict:
+    service = get_email_service(email_service_id)
+    ok, msg, mail_cfg = _extract_mail_worker_config(service)
+    if not ok:
+        raise RuntimeError(msg)
+
+    cfg = Config()
+    cfg.proxy = proxy or None
+    cfg.mail.worker_domain = mail_cfg["worker_domain"]
+    cfg.mail.admin_token = mail_cfg["admin_token"]
+    cfg.mail.email_domain = mail_cfg["email_domain"]
+
+    mail = MailProvider(
+        worker_domain=cfg.mail.worker_domain,
+        admin_token=cfg.mail.admin_token,
+        email_domain=cfg.mail.email_domain,
+    )
+    af = AuthFlow(cfg)
+    auth = af.run_register(
+        mail,
+        policy=RegistrationRetryPolicy(
+            max_flow_attempts=max(1, int(flow_attempts)),
+            max_otp_attempts=max(1, int(otp_attempts)),
+            max_session_attempts=max(1, int(session_attempts)),
+        ),
+    )
+
+    store = ResultStore(output_dir=OUTPUT_DIR)
+    store.save_credentials(auth.to_dict())
+    store.append_credentials_csv(auth.to_dict())
+    return auth.to_dict()
+
+
+def _render_registration_page():
+    st.subheader("注册")
+    services = [s for s in list_email_services(enabled_only=True) if s.get("service_type") == "mail_worker"]
+    if not services:
+        st.warning("暂无可用邮箱服务。请先到「邮箱服务」分类新增并启用服务。")
+        return
+
+    opts = {
+        f"#{s['id']} {s.get('name', '-')}" +
+        f" ({(s.get('config') or {}).get('email_domain', '-')})": s["id"]
+        for s in services
+    }
+    selected_label = st.selectbox("邮箱服务", list(opts.keys()), key="reg_mail_service")
+    selected_id = opts[selected_label]
+    reg_proxy, reg_proxy_id = _render_proxy_selector(
+        key_prefix="reg",
+        label="注册代理",
+        placeholder="http://127.0.0.1:7897",
+    )
+
+    default_flow, default_otp, default_session = _get_registration_retry_defaults()
+    c1, c2, c3, c4 = st.columns(4)
+    reg_count = c1.number_input("注册数量", min_value=1, max_value=20, value=1, step=1, key="reg_count")
+    reg_flow_attempts = c2.number_input("全流程重试", min_value=1, max_value=5, value=default_flow, step=1, key="reg_flow_attempts")
+    reg_otp_attempts = c3.number_input("OTP 重试", min_value=1, max_value=5, value=default_otp, step=1, key="reg_otp_attempts")
+    reg_session_attempts = c4.number_input("Session 重试", min_value=1, max_value=8, value=default_session, step=1, key="reg_session_attempts")
+    st.caption("建议值: 全流程=2, OTP=2, Session=3。网络不稳定时可适当提高。")
+
+    if "reg_results" not in st.session_state:
+        st.session_state.reg_results = []
+
+    if st.button("开始注册", type="primary", use_container_width=True, key="reg_start_btn"):
+        results = []
+        for idx in range(int(reg_count)):
+            with st.spinner(f"注册中... ({idx + 1}/{int(reg_count)})"):
+                try:
+                    if reg_proxy_id:
+                        mark_proxy_used(reg_proxy_id)
+                    auth_dict = _run_registration_once(
+                        selected_id,
+                        reg_proxy,
+                        int(reg_flow_attempts),
+                        int(reg_otp_attempts),
+                        int(reg_session_attempts),
+                    )
+                    results.append({
+                        "status": "success",
+                        "email": auth_dict.get("email", ""),
+                        "session_token": auth_dict.get("session_token", ""),
+                        "access_token": auth_dict.get("access_token", ""),
+                        "device_id": auth_dict.get("device_id", ""),
+                        "error": "",
+                    })
+                except Exception as e:
+                    results.append({
+                        "status": "failed",
+                        "email": "",
+                        "session_token": "",
+                        "access_token": "",
+                        "device_id": "",
+                        "error": str(e),
+                    })
+        st.session_state.reg_results = results
+
+    rows = st.session_state.get("reg_results", [])
+    if rows:
+        import pandas as pd
+        st.divider()
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "状态": "✅ 成功" if r["status"] == "success" else "❌ 失败",
+                    "邮箱": r["email"] or "-",
+                    "错误": _sanitize_error(r.get("error", "")) if r["status"] == "failed" else "",
+                }
+                for r in rows
+            ]),
+            hide_index=True,
+            use_container_width=True,
+        )
+        ok_count = len([r for r in rows if r["status"] == "success"])
+        st.caption(f"完成: {ok_count}/{len(rows)}")
+
+
+def _render_email_service_page():
+    st.subheader("邮箱服务")
+    st.caption("参考 codex-console2 的服务化思路：服务配置集中管理，注册/支付页面只做引用。")
+
+    with st.expander("从 config.json 导入 Worker 配置", expanded=False):
+        if st.button("导入为邮箱服务", key="import_mail_cfg_btn"):
+            try:
+                cfg = Config.from_file("config.json")
+                mail_cfg = {
+                    "worker_domain": cfg.mail.worker_domain,
+                    "admin_token": cfg.mail.admin_token,
+                    "email_domain": cfg.mail.email_domain,
+                }
+                if not all(mail_cfg.values()):
+                    st.error("config.json 的 mail 配置不完整，导入失败")
+                else:
+                    create_email_service(
+                        name="Config 导入服务",
+                        service_type="mail_worker",
+                        config=mail_cfg,
+                        is_enabled=True,
+                        priority=100,
+                    )
+                    st.success("已导入邮箱服务")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"导入失败: {e}")
+
+    with st.expander("新增邮箱服务", expanded=True):
+        col1, col2 = st.columns(2)
+        svc_name = col1.text_input("服务名称", value="默认 Worker 服务", key="new_svc_name")
+        svc_priority = col2.number_input("优先级(越小越优先)", min_value=1, max_value=9999, value=100, key="new_svc_pri")
+        w1, w2, w3 = st.columns(3)
+        worker_domain = w1.text_input("worker_domain", placeholder="https://mail-worker.example.com", key="new_worker_domain")
+        admin_token = w2.text_input("admin_token", type="password", key="new_admin_token")
+        email_domain = w3.text_input("email_domain", placeholder="example.com", key="new_email_domain")
+        enabled = st.checkbox("启用", value=True, key="new_svc_enabled")
+
+        if st.button("新增服务", type="primary", key="create_svc_btn"):
+            if not (svc_name.strip() and worker_domain.strip() and admin_token.strip() and email_domain.strip()):
+                st.error("请完整填写服务名称与 Worker 配置")
+            else:
+                try:
+                    create_email_service(
+                        name=svc_name.strip(),
+                        service_type="mail_worker",
+                        config={
+                            "worker_domain": worker_domain.strip(),
+                            "admin_token": admin_token.strip(),
+                            "email_domain": email_domain.strip(),
+                        },
+                        is_enabled=enabled,
+                        priority=int(svc_priority),
+                    )
+                    st.success("邮箱服务已新增")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"新增失败: {e}")
+
+    services = list_email_services(enabled_only=False)
+    if not services:
+        st.info("暂无邮箱服务配置")
+        return
+
+    import pandas as pd
+    st.divider()
+    st.dataframe(
+        pd.DataFrame([
+            {
+                "ID": s["id"],
+                "名称": s["name"],
+                "类型": s["service_type"],
+                "启用": "是" if s["is_enabled"] else "否",
+                "优先级": s.get("priority", 100),
+                "域名": (s.get("config") or {}).get("email_domain", "-"),
+                "最近测试": s.get("last_test_status") or "-",
+            }
+            for s in services
+        ]),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    for svc in services:
+        cfg = svc.get("config") or {}
+        with st.expander(f"#{svc['id']} {svc['name']} ({'启用' if svc['is_enabled'] else '禁用'})", expanded=False):
+            c1, c2, c3 = st.columns(3)
+            name = c1.text_input("服务名称", value=svc["name"], key=f"svc_name_{svc['id']}")
+            priority = c2.number_input("优先级", min_value=1, max_value=9999, value=int(svc.get("priority", 100)), key=f"svc_pri_{svc['id']}")
+            is_enabled = c3.checkbox("启用", value=svc["is_enabled"], key=f"svc_enabled_{svc['id']}")
+
+            w1, w2, w3 = st.columns(3)
+            worker_domain = w1.text_input("worker_domain", value=cfg.get("worker_domain", ""), key=f"svc_wd_{svc['id']}")
+            admin_token = w2.text_input("admin_token", value=cfg.get("admin_token", ""), type="password", key=f"svc_token_{svc['id']}")
+            email_domain = w3.text_input("email_domain", value=cfg.get("email_domain", ""), key=f"svc_domain_{svc['id']}")
+
+            b1, b2, b3 = st.columns(3)
+            if b1.button("保存", key=f"svc_save_{svc['id']}"):
+                try:
+                    update_email_service(
+                        svc["id"],
+                        name=name,
+                        priority=int(priority),
+                        is_enabled=is_enabled,
+                        config={
+                            "worker_domain": worker_domain.strip(),
+                            "admin_token": admin_token.strip(),
+                            "email_domain": email_domain.strip(),
+                        },
+                    )
+                    st.success("已保存")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"保存失败: {e}")
+            if b2.button("测试", key=f"svc_test_{svc['id']}"):
+                rs = test_email_service(svc["id"])
+                if rs.get("success"):
+                    st.success(f"测试成功，创建邮箱: {rs.get('mailbox')}")
+                else:
+                    st.error(f"测试失败: {rs.get('error', '')}")
+                st.rerun()
+            if b3.button("删除", key=f"svc_del_{svc['id']}"):
+                delete_email_service(svc["id"])
+                st.warning("已删除")
+                st.rerun()
+
+
+def _render_account_management_page():
+    st.subheader("账号管理")
+    tab_accounts, tab_history = st.tabs(["账号", "执行历史"])
+
+    with tab_accounts:
+        history = get_code_history(st.session_state.verified_code)
+        records = _build_account_records(history)
+        if not records:
+            st.info("暂无账号记录")
+            return
+
+        subscribed_count = len([x for x in records if x["subscribed"]])
+        unsubscribed_count = len(records) - subscribed_count
+        token_count = len([x for x in records if x["has_token"]])
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("账号总数", len(records))
+        c2.metric("已开通订阅", subscribed_count)
+        c3.metric("未开通订阅", unsubscribed_count)
+        c4.metric("可用 Token", token_count)
+        if st.button("刷新数据", key="acct_mgmt_refresh_btn"):
+            st.rerun()
+
+        st.caption("订阅状态优先依据 Stripe confirm 返回判断，不再仅按执行状态着色。")
+
+        f1, f2, f3 = st.columns([3, 1, 1])
+        search_kw = f1.text_input("搜索邮箱", placeholder="输入邮箱关键字", key="acct_mgmt_search").strip().lower()
+        plan_filter = f2.selectbox("计划筛选", ["全部", "Team", "Plus", "Free", "Unknown"], key="acct_mgmt_plan")
+        sub_filter = f3.selectbox("订阅筛选", ["全部", "已开通", "未开通"], key="acct_mgmt_sub")
+
+        filtered = []
+        for row in records:
+            if search_kw and search_kw not in row["email"].lower():
+                continue
+            if plan_filter != "全部" and row["plan_type"] != plan_filter:
+                continue
+            if sub_filter == "已开通" and not row["subscribed"]:
+                continue
+            if sub_filter == "未开通" and row["subscribed"]:
+                continue
+            filtered.append(row)
+
+        import pandas as pd
+
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "邮箱": r["email"],
+                    "计划": r["plan_type"],
+                    "订阅": ("🟢 " + r["subscription_label"]) if r["subscribed"] else "🔴 未开通",
+                    "Token": "✅" if r["has_token"] else "❌",
+                    "执行次数": r["run_count"],
+                    "最近执行": r["created_at"],
+                    "最近状态": {"success": "✅ 成功", "failed": "❌ 失败", "running": "🔄 运行中", "pending": "⏳ 等待"}.get(r["latest_status"], r["latest_status"]),
+                }
+                for r in filtered
+            ]),
+            hide_index=True,
+            use_container_width=True,
+        )
+        st.caption(f"共 {len(filtered)}/{len(records)} 个账号")
+
+        st.divider()
+        for idx, acct in enumerate(filtered):
+            exp_title = f"{acct['email']}  {'🟢' if acct['subscribed'] else '🔴'} {acct['subscription_label']}"
+            with st.expander(exp_title, expanded=False):
+                x1, x2, x3 = st.columns(3)
+                x1.text_input("计划", value=acct["plan_type"], disabled=True, key=f"acct_plan_{idx}")
+                x2.text_input("最近执行", value=acct["created_at"], disabled=True, key=f"acct_time_{idx}")
+                x3.text_input("执行次数", value=str(acct["run_count"]), disabled=True, key=f"acct_runs_{idx}")
+                if acct["latest_error"]:
+                    st.warning(_sanitize_error(acct["latest_error"]))
+                if acct["has_token"]:
+                    st.code(
+                        f"access_token: {acct.get('access_token', '')}\n"
+                        f"session_token: {acct.get('session_token', '')}\n"
+                        f"device_id: {acct.get('device_id', '')}",
+                        language="yaml",
+                    )
+                else:
+                    st.caption("无可用 Token")
+                with st.expander("查看原始结果", expanded=False):
+                    st.json(acct["_data"])
+
+    with tab_history:
+        _history = get_code_history(st.session_state.verified_code)
+        if not _history:
+            st.info("暂无执行历史")
+            return
+        import pandas as pd
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "状态": {"success": "✅ 成功", "failed": "❌ 失败", "running": "🔄 运行中", "pending": "⏳ 等待"}.get(r["status"], r["status"]),
+                    "邮箱": r.get("email") or "-",
+                    "计划": r.get("plan_type") or "-",
+                    "备注": _sanitize_error(r.get("error_msg") or "") if r["status"] == "failed" else "",
+                    "时间": r["created_at"][:19],
+                }
+                for r in _history
+            ]),
+            hide_index=True,
+            use_container_width=True,
+        )
+        st.caption(f"共 {len(_history)} 条记录")
+
+
+def _render_settings_page():
+    st.subheader("设置")
+    tab_proxy, tab_reg, tab_sys = st.tabs(["代理设置", "注册配置", "系统信息"])
+
+    with tab_proxy:
+        st.caption("参考 codex-console2：代理集中管理，执行页/注册页仅选择使用。")
+
+        with st.expander("导入现有代理", expanded=False):
+            cfg_proxy = ""
+            try:
+                cfg_proxy = (Config.from_file("config.json").proxy or "").strip()
+            except Exception:
+                cfg_proxy = ""
+            manual_proxy = (st.session_state.get("w_proxy_manual", "") or "").strip()
+            reg_manual_proxy = (st.session_state.get("reg_proxy_manual", "") or "").strip()
+
+            if cfg_proxy:
+                st.code(cfg_proxy, language="bash")
+                if st.button("导入 config.json 代理", key="import_cfg_proxy_btn"):
+                    try:
+                        create_proxy_from_url(
+                            name=f"ConfigProxy-{datetime_now_compact()}",
+                            proxy_url=cfg_proxy,
+                            is_enabled=True,
+                            is_default=(get_default_proxy_config(enabled_only=False) is None),
+                            priority=100,
+                        )
+                        st.success("已导入 config.json 代理")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"导入失败: {e}")
+            else:
+                st.caption("config.json 中未检测到代理配置")
+
+            if manual_proxy or reg_manual_proxy:
+                to_import = manual_proxy or reg_manual_proxy
+                st.code(to_import, language="bash")
+                if st.button("导入当前手动代理", key="import_manual_proxy_btn"):
+                    try:
+                        create_proxy_from_url(
+                            name=f"ManualProxy-{datetime_now_compact()}",
+                            proxy_url=to_import,
+                            is_enabled=True,
+                            is_default=(get_default_proxy_config(enabled_only=False) is None),
+                            priority=100,
+                        )
+                        st.success("已导入手动代理")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"导入失败: {e}")
+
+        with st.expander("新增代理", expanded=True):
+            a1, a2, a3, a4 = st.columns([3, 1, 3, 2])
+            p_name = a1.text_input("代理名称", value="默认代理", key="new_proxy_name")
+            p_type = a2.selectbox("类型", ["http", "socks5"], key="new_proxy_type")
+            p_host = a3.text_input("Host", placeholder="127.0.0.1", key="new_proxy_host")
+            p_port = a4.number_input("Port", min_value=1, max_value=65535, value=7897, key="new_proxy_port")
+            b1, b2, b3, b4 = st.columns([2, 2, 1, 1])
+            p_user = b1.text_input("用户名(可选)", key="new_proxy_user")
+            p_pass = b2.text_input("密码(可选)", type="password", key="new_proxy_pass")
+            p_enabled = b3.checkbox("启用", value=True, key="new_proxy_enabled")
+            p_default = b4.checkbox("默认", value=False, key="new_proxy_default")
+            p_priority = st.number_input("优先级(越小越优先)", min_value=1, max_value=9999, value=100, key="new_proxy_priority")
+            if st.button("新增代理", type="primary", key="create_proxy_btn"):
+                try:
+                    create_proxy(
+                        name=p_name,
+                        proxy_type=p_type,
+                        host=p_host,
+                        port=int(p_port),
+                        username=p_user,
+                        password=p_pass,
+                        is_enabled=p_enabled,
+                        is_default=p_default,
+                        priority=int(p_priority),
+                    )
+                    st.success("代理已新增")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"新增失败: {e}")
+
+        proxies = list_proxies(enabled_only=False, include_secret=True)
+        if not proxies:
+            st.info("暂无代理配置")
+        else:
+            import pandas as pd
+
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "ID": p["id"],
+                        "名称": p["name"],
+                        "类型": p["proxy_type"],
+                        "地址": f"{p['proxy_host']}:{p['proxy_port']}",
+                        "默认": "是" if p["is_default"] else "否",
+                        "启用": "是" if p["is_enabled"] else "否",
+                        "最后使用": (p.get("last_used_at") or "")[:19] if p.get("last_used_at") else "-",
+                    }
+                    for p in proxies
+                ]),
+                hide_index=True,
+                use_container_width=True,
+            )
+
+            for p in proxies:
+                with st.expander(
+                    f"#{p['id']} {p['name']} ({'默认' if p['is_default'] else '非默认'} / {'启用' if p['is_enabled'] else '禁用'})",
+                    expanded=False,
+                ):
+                    c1, c2, c3, c4 = st.columns([3, 1, 3, 2])
+                    e_name = c1.text_input("名称", value=p["name"], key=f"proxy_name_{p['id']}")
+                    e_type = c2.selectbox("类型", ["http", "socks5"], index=0 if p["proxy_type"] == "http" else 1, key=f"proxy_type_{p['id']}")
+                    e_host = c3.text_input("Host", value=p["proxy_host"], key=f"proxy_host_{p['id']}")
+                    e_port = c4.number_input("Port", min_value=1, max_value=65535, value=int(p["proxy_port"]), key=f"proxy_port_{p['id']}")
+                    d1, d2, d3 = st.columns(3)
+                    e_user = d1.text_input("用户名", value=p.get("username") or "", key=f"proxy_user_{p['id']}")
+                    e_pass = d2.text_input("密码(留空不改)", value="", type="password", key=f"proxy_pass_{p['id']}")
+                    e_pri = d3.number_input("优先级", min_value=1, max_value=9999, value=int(p.get("priority", 100)), key=f"proxy_pri_{p['id']}")
+                    e_enabled = st.checkbox("启用", value=bool(p["is_enabled"]), key=f"proxy_enabled_{p['id']}")
+
+                    k1, k2, k3, k4 = st.columns(4)
+                    if k1.button("保存", key=f"proxy_save_{p['id']}"):
+                        try:
+                            update_proxy(
+                                p["id"],
+                                name=e_name,
+                                proxy_type=e_type,
+                                host=e_host,
+                                port=int(e_port),
+                                username=e_user,
+                                password=(e_pass if e_pass else None),
+                                is_enabled=e_enabled,
+                                priority=int(e_pri),
+                            )
+                            st.success("已保存")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"保存失败: {e}")
+                    if k2.button("测试", key=f"proxy_test_{p['id']}"):
+                        rs = test_proxy(p["id"])
+                        if rs.get("success"):
+                            st.success(f"连通成功，出口 IP: {rs.get('ip', '-')}")
+                        else:
+                            st.error(f"连通失败: {rs.get('error', '')}")
+                    if k3.button("设为默认", key=f"proxy_default_{p['id']}"):
+                        set_default_proxy(p["id"])
+                        st.success("已设为默认代理")
+                        st.rerun()
+                    if k4.button("删除", key=f"proxy_del_{p['id']}"):
+                        delete_proxy(p["id"])
+                        st.warning("已删除")
+                        st.rerun()
+
+    with tab_reg:
+        st.caption("注册重试默认值（注册页和支付页的新注册模式会读取这些默认配置）。")
+        d_flow, d_otp, d_session = _get_registration_retry_defaults()
+        r1, r2, r3 = st.columns(3)
+        s_flow = r1.number_input("全流程重试默认值", min_value=1, max_value=5, value=d_flow, key="set_reg_flow")
+        s_otp = r2.number_input("OTP 重试默认值", min_value=1, max_value=5, value=d_otp, key="set_reg_otp")
+        s_session = r3.number_input("Session 重试默认值", min_value=1, max_value=8, value=d_session, key="set_reg_session")
+        if st.button("保存注册配置", type="primary", key="save_reg_defaults_btn"):
+            set_setting(REG_SETTING_FLOW_ATTEMPTS, int(s_flow))
+            set_setting(REG_SETTING_OTP_ATTEMPTS, int(s_otp))
+            set_setting(REG_SETTING_SESSION_ATTEMPTS, int(s_session))
+            st.success("注册配置已保存")
+
+    with tab_sys:
+        all_proxy_count = len(list_proxies(enabled_only=False))
+        all_proxy_enabled = len(list_proxies(enabled_only=True))
+        st.code(
+            f"code_system_enabled={_ENABLE_CODE_SYSTEM}\n"
+            f"dev_mode={'--dev' in sys.argv}\n"
+            f"output_dir={OUTPUT_DIR}\n"
+            f"proxy_total={all_proxy_count}\n"
+            f"proxy_enabled={all_proxy_enabled}\n"
+            f"email_services={len(list_email_services(enabled_only=False))}",
+            language="ini",
+        )
+
+
 for k, v in {"log_buffer": [], "running": False, "result": None}.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -492,7 +1222,8 @@ pull_captured_logs()
 _widget_defaults = {
     "w_exp_month": "12",
     "w_exp_year": "2030",
-    "w_proxy": "",
+    "w_proxy_manual": "",
+    "reg_proxy_manual": "",
     "w_billing_name": "",
 }
 for _dk, _dv in _widget_defaults.items():
@@ -517,7 +1248,7 @@ st.markdown(
     '<span style="font-family:\'Courier New\',monospace;font-weight:900;'
     'background:linear-gradient(135deg,#7c3aed,#3b82f6);-webkit-background-clip:text;'
     '-webkit-text-fill-color:transparent;font-size:1.15em;">ABC</span>'
-    ' <span style="font-size:0.5em;opacity:0.6;vertical-align:middle;">(Auto BindCard)</span>'
+    ' <span style="font-size:0.5em;opacity:0.6;vertical-align:middle;">(ets-abc-auto-bind-card)</span>'
     '</h1>',
     unsafe_allow_html=True,
 )
@@ -563,6 +1294,27 @@ if _code_info:
             st.session_state.verified_code = ""
             st.rerun()
 
+# ── 顶部分类导航 ──
+category = st.radio(
+    "分类",
+    ["注册", "账号管理", "邮箱服务", "支付绑卡", "设置"],
+    index=3,
+    horizontal=True,
+)
+
+if category == "注册":
+    _render_registration_page()
+    st.stop()
+if category == "账号管理":
+    _render_account_management_page()
+    st.stop()
+if category == "邮箱服务":
+    _render_email_service_page()
+    st.stop()
+if category == "设置":
+    _render_settings_page()
+    st.stop()
+
 # ── 账号来源选择 ──
 # 从数据库获取当前兑换码的有 token 的执行记录 (用于「选择已有账号」)
 _code_history = get_code_history(st.session_state.verified_code) if _ENABLE_CODE_SYSTEM else []
@@ -588,6 +1340,7 @@ with acct_col:
 
 do_checkout = True
 do_payment = True
+selected_proxy_id = None
 
 if dev_mode:
     with proxy_col:
@@ -596,7 +1349,11 @@ if dev_mode:
         do_payment = sc2.checkbox("提交支付", value=True)
 
 with proxy_col:
-    proxy = st.text_input("代理", placeholder="http://127.0.0.1:7897", key="w_proxy")
+    proxy, selected_proxy_id = _render_proxy_selector(
+        key_prefix="w",
+        label="代理",
+        placeholder="http://127.0.0.1:7897",
+    )
 
 # ── 已有账号选择 / Token 输入 ──
 cred_email = ""
@@ -631,24 +1388,73 @@ elif account_source == "手动输入 Token":
                                         help="浏览器 F12 → Application → Cookies → __Secure-next-auth.session-token")
     cred_email = st.text_input("邮箱 (可选)", placeholder="user@example.com", key="w_manual_email")
 
-# ── 注册模式下显示邮箱配置 ──
+# ── 注册模式下选择邮箱服务 ──
+selected_email_service_id = None
+_def_flow, _def_otp, _def_session = _get_registration_retry_defaults()
+reg_flow_attempts = _def_flow
+reg_otp_attempts = _def_otp
+reg_session_attempts = _def_session
 if do_register:
-    with st.expander("邮箱配置", expanded=True):
-        _mc1, _mc2, _mc3 = st.columns(3)
-        mail_worker = _mc1.text_input("Worker API", placeholder="https://mail-api.example.com", key="w_mail_worker_reg")
-        mail_domain = _mc2.text_input("邮箱域名", placeholder="example.com", key="w_mail_domain_reg")
-        mail_token = _mc3.text_input("密码", placeholder="your-mail-token", type="password", key="w_mail_token_reg")
+    with st.expander("邮箱服务", expanded=True):
+        active_mail_services = [s for s in list_email_services(enabled_only=True) if s.get("service_type") == "mail_worker"]
+        if not active_mail_services:
+            st.error("暂无可用邮箱服务。请先到「邮箱服务」分类新增并启用服务。")
+        else:
+            default_svc = get_default_email_service("mail_worker")
+            labels = [
+                f"#{s['id']} {s.get('name', '-')}"
+                f" ({(s.get('config') or {}).get('email_domain', '-')})"
+                for s in active_mail_services
+            ]
+            id_map = {labels[idx]: active_mail_services[idx]["id"] for idx in range(len(active_mail_services))}
+            default_idx = 0
+            if default_svc:
+                for idx, s in enumerate(active_mail_services):
+                    if s["id"] == default_svc["id"]:
+                        default_idx = idx
+                        break
+            selected_label = st.selectbox("选择邮箱服务", labels, index=default_idx, key="w_reg_mail_service_sel")
+            selected_email_service_id = id_map[selected_label]
+            selected_svc = get_email_service(selected_email_service_id) or {}
+            selected_cfg = selected_svc.get("config") or {}
+            st.caption(
+                f"服务类型: {selected_svc.get('service_type', '-')} | "
+                f"域名: {selected_cfg.get('email_domain', '-')}"
+            )
+            r1, r2, r3 = st.columns(3)
+            reg_flow_attempts = r1.number_input(
+                "全流程重试",
+                min_value=1,
+                max_value=5,
+                value=_def_flow,
+                step=1,
+                key="w_reg_flow_attempts",
+                help="注册全链路失败后，最多重新走完整流程的次数。",
+            )
+            reg_otp_attempts = r2.number_input(
+                "OTP 重试",
+                min_value=1,
+                max_value=5,
+                value=_def_otp,
+                step=1,
+                key="w_reg_otp_attempts",
+                help="验证码等待/校验失败时，单轮流程内重试次数。",
+            )
+            reg_session_attempts = r3.number_input(
+                "Session 重试",
+                min_value=1,
+                max_value=8,
+                value=_def_session,
+                step=1,
+                key="w_reg_session_attempts",
+                help="建号后获取 session/access_token 的重试次数。",
+            )
 
 
 # 默认值 (非开发者模式下不显示这些设置)
 use_browser_mode = True
 captcha_key = ""
 captcha_api_url = ""
-if not do_register:
-    # 非注册模式时，邮箱配置使用空默认值 (开发者模式下有单独的输入框)
-    mail_worker = ""
-    mail_domain = ""
-    mail_token = ""
 # 计划类型选择 (始终可见)
 plan_type_label = st.radio(
     "选择计划",
@@ -702,11 +1508,7 @@ if dev_mode:
 
         st.markdown("---")
         st.markdown("**邮箱 & 计划设置**")
-        if not do_register:
-            mail_worker = st.text_input("邮箱 Worker", placeholder="https://mail-api.example.com", key="w_mail_worker_dev")
-            adv_mc1, adv_mc2 = st.columns(2)
-            mail_domain = adv_mc1.text_input("邮箱域名", placeholder="example.com", key="w_mail_domain_dev")
-            mail_token = adv_mc2.text_input("密码", placeholder="your-mail-token", type="password", key="w_mail_token_dev")
+        st.caption("邮箱配置已统一迁移到「邮箱服务」分类管理。")
         if plan_type == "team":
             adv_tc1, adv_tc2, adv_tc3 = st.columns(3)
             workspace_name = adv_tc1.text_input("Workspace", value="MyWorkspace")
@@ -897,11 +1699,10 @@ def _calc_progress_pct():
 def _run_flow_thread(rd, cs):
     """在后台线程中执行完整流程 (cs = config_snapshot)"""
     try:
+        if cs.get("proxy_id"):
+            mark_proxy_used(int(cs["proxy_id"]))
         cfg = Config()
         cfg.proxy = cs["proxy"]
-        cfg.mail.email_domain = cs["mail_domain"]
-        cfg.mail.worker_domain = cs["mail_worker"]
-        cfg.mail.admin_token = cs["mail_token"]
         cfg.team_plan.workspace_name = cs["workspace_name"]
         cfg.team_plan.seat_quantity = cs["seat_quantity"]
         cfg.team_plan.promo_campaign_id = cs["promo_campaign"]
@@ -920,9 +1721,24 @@ def _run_flow_thread(rd, cs):
         af = None
 
         if cs["do_register"]:
+            svc = get_email_service(cs.get("email_service_id", 0) or 0)
+            ok, msg, mail_cfg = _extract_mail_worker_config(svc)
+            if not ok:
+                raise RuntimeError(msg)
+            cfg.mail.worker_domain = mail_cfg["worker_domain"]
+            cfg.mail.admin_token = mail_cfg["admin_token"]
+            cfg.mail.email_domain = mail_cfg["email_domain"]
+
             mp = MailProvider(worker_domain=cfg.mail.worker_domain, admin_token=cfg.mail.admin_token, email_domain=cfg.mail.email_domain)
             af = AuthFlow(cfg)
-            auth_result = af.run_register(mp)
+            auth_result = af.run_register(
+                mp,
+                policy=RegistrationRetryPolicy(
+                    max_flow_attempts=max(1, int(cs.get("reg_flow_attempts", 2) or 2)),
+                    max_otp_attempts=max(1, int(cs.get("reg_otp_attempts", 2) or 2)),
+                    max_session_attempts=max(1, int(cs.get("reg_session_attempts", 3) or 3)),
+                ),
+            )
             rd["email"] = auth_result.email
             rd["session_token"] = auth_result.session_token
             rd["access_token"] = auth_result.access_token
@@ -1038,12 +1854,8 @@ with tab_run:
         # 表单验证
         _errors = []
         if do_register:
-            if not mail_worker or not mail_worker.startswith("http"):
-                _errors.append("请填写邮箱 Worker API 地址")
-            if not mail_domain:
-                _errors.append("请填写邮箱域名")
-            if not mail_token:
-                _errors.append("请填写密码")
+            if not selected_email_service_id:
+                _errors.append("请先在「邮箱服务」配置并选择可用服务")
         elif use_existing_creds and do_checkout:
             if not cred_access_token:
                 _errors.append("请提供 access_token")
@@ -1082,7 +1894,11 @@ with tab_run:
 
         st.session_state._flow_config = {
             "proxy": proxy or None,
-            "mail_domain": mail_domain, "mail_worker": mail_worker, "mail_token": mail_token,
+            "proxy_id": selected_proxy_id,
+            "email_service_id": selected_email_service_id,
+            "reg_flow_attempts": int(reg_flow_attempts),
+            "reg_otp_attempts": int(reg_otp_attempts),
+            "reg_session_attempts": int(reg_session_attempts),
             "workspace_name": workspace_name, "seat_quantity": seat_quantity, "promo_campaign": promo_campaign,
             "plan_type": plan_type,
             "captcha_api_url": captcha_api_url, "captcha_key": captcha_key,
@@ -1187,25 +2003,7 @@ with tab_run:
 # ════════════════════════════════════════
 with tab_accounts:
     _history = get_code_history(st.session_state.verified_code)
-    # 显示所有有邮箱的账号 (注册成功的, 不管支付是否成功)
-    _acct_rows = []
-    for r in _history:
-        if r.get("result_json"):
-            try:
-                rd = json.loads(r["result_json"])
-                if rd.get("email"):
-                    _acct_rows.append({
-                        "exec_id": r["id"],
-                        "email": rd["email"],
-                        "plan_type": r.get("plan_type") or "-",
-                        "status": r["status"],
-                        "created_at": r["created_at"][:19],
-                        "has_token": bool(rd.get("access_token")),
-                        "_data": rd,
-                    })
-            except Exception:
-                pass
-
+    _acct_rows = _build_account_records(_history)
     if _acct_rows:
         import pandas as pd
         _disp_rows = []
@@ -1213,7 +2011,8 @@ with tab_accounts:
             _disp_rows.append({
                 "邮箱": a["email"],
                 "计划": a["plan_type"],
-                "支付": "✅ 成功" if a["status"] == "success" else "❌ 失败",
+                "订阅": ("🟢 " + a["subscription_label"]) if a["subscribed"] else "🔴 未开通",
+                "Token": "✅" if a["has_token"] else "❌",
                 "时间": a["created_at"],
             })
         st.dataframe(pd.DataFrame(_disp_rows), hide_index=True, use_container_width=True)
@@ -1222,7 +2021,7 @@ with tab_accounts:
         st.divider()
         for idx, acct in enumerate(_acct_rows):
             _data = acct["_data"]
-            with st.expander(f"{acct['email']}  {'✅' if acct['status'] == 'success' else '❌'}", expanded=False):
+            with st.expander(f"{acct['email']}  {'🟢' if acct['subscribed'] else '🔴'} {acct['subscription_label']}", expanded=False):
                 if _data.get("access_token"):
                     st.code(
                         f"access_token: {_data.get('access_token', 'N/A')}\n"

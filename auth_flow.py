@@ -9,7 +9,10 @@ import json
 import logging
 import random
 import re
+import time
 import uuid
+from dataclasses import dataclass
+from enum import Enum
 from typing import Optional
 from urllib.parse import urlparse, parse_qs, urljoin
 
@@ -18,6 +21,26 @@ from mail_provider import MailProvider
 from http_client import create_http_session
 
 logger = logging.getLogger(__name__)
+
+
+class RegistrationStage(str, Enum):
+    PRECHECK = "precheck"
+    EMAIL_CREATE = "email_create"
+    AUTHORIZE_PREPARE = "authorize_prepare"
+    OTP_VERIFY = "otp_verify"
+    ACCOUNT_CREATE = "account_create"
+    SESSION_ACQUIRE = "session_acquire"
+    RELAUNCH_LOGIN = "relaunch_login"
+    DONE = "done"
+
+
+@dataclass
+class RegistrationRetryPolicy:
+    max_flow_attempts: int = 2
+    max_otp_attempts: int = 2
+    otp_wait_timeout: int = 120
+    max_session_attempts: int = 3
+    retry_backoff_seconds: float = 2.0
 
 
 class AuthResult:
@@ -59,6 +82,111 @@ class AuthFlow:
             impersonate=self._impersonate_candidates[self._impersonate_idx],
         )
         self.result = AuthResult()
+        self._last_stage: RegistrationStage | None = None
+
+    def _log_stage(self, stage: RegistrationStage, attempt: int, detail: str):
+        self._last_stage = stage
+        logger.info(f"[注册][尝试{attempt}] [{stage.value}] {detail}")
+
+    def _reset_auth_flow(self):
+        """重置会话，准备重新发起授权流程（参考 codex-console2 的恢复模式）。"""
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = create_http_session(
+            proxy=self.config.proxy,
+            impersonate=self._impersonate_candidates[self._impersonate_idx],
+        )
+        # 保留邮箱，重置 token 相关字段
+        keep_email = self.result.email
+        self.result = AuthResult()
+        self.result.email = keep_email
+
+    def _prepare_authorize_flow(self, attempt: int) -> tuple[str, str]:
+        """初始化授权流程，返回 (device_id, sentinel_token)。"""
+        self._log_stage(RegistrationStage.AUTHORIZE_PREPARE, attempt, "准备授权链路")
+        csrf_token = self.get_csrf_token()
+        auth_url = self.get_auth_url(csrf_token)
+        device_id = self.auth_oauth_init(auth_url)
+        sentinel = self.get_sentinel_token(device_id)
+        return device_id, sentinel
+
+    def _send_and_verify_otp_with_retry(
+        self,
+        mail_provider: MailProvider,
+        email: str,
+        attempt: int,
+        policy: RegistrationRetryPolicy,
+    ):
+        self._log_stage(RegistrationStage.OTP_VERIFY, attempt, "发送并校验 OTP")
+        self.send_otp()
+
+        last_error = ""
+        for otp_try in range(1, policy.max_otp_attempts + 1):
+            try:
+                otp_code = mail_provider.wait_for_otp(email, timeout=policy.otp_wait_timeout)
+                self.verify_otp(otp_code)
+                logger.info(f"[注册][尝试{attempt}] OTP 校验成功 (第{otp_try}次)")
+                return
+            except Exception as e:
+                last_error = str(e)
+                if otp_try < policy.max_otp_attempts:
+                    logger.warning(f"[注册][尝试{attempt}] OTP 第{otp_try}次失败，准备重发: {last_error}")
+                    self.send_otp()
+                    time.sleep(2)
+
+        raise RuntimeError(f"OTP 验证失败: {last_error}")
+
+    def _acquire_session_with_retry(
+        self,
+        continue_url: str,
+        attempt: int,
+        policy: RegistrationRetryPolicy,
+    ):
+        self._log_stage(RegistrationStage.SESSION_ACQUIRE, attempt, "获取 session/access_token")
+        last_error = ""
+        callback_url = ""
+
+        for sess_try in range(1, policy.max_session_attempts + 1):
+            try:
+                callback_url, _ = self.follow_redirect_chain(continue_url)
+                self.get_auth_session()
+                if callback_url and continue_url:
+                    self.oauth_token_exchange(callback_url, continue_url)
+                if self.result.is_valid():
+                    logger.info(f"[注册][尝试{attempt}] Session 获取成功 (第{sess_try}次)")
+                    return
+                last_error = "session_token 或 access_token 为空"
+            except Exception as e:
+                last_error = str(e)
+
+            logger.warning(f"[注册][尝试{attempt}] Session 获取失败 (第{sess_try}次): {last_error}")
+            if sess_try < policy.max_session_attempts:
+                time.sleep(policy.retry_backoff_seconds * sess_try)
+
+        raise RuntimeError(f"获取认证 Session 失败: {last_error}")
+
+    def _restart_login_for_token(
+        self,
+        mail_provider: MailProvider,
+        email: str,
+        attempt: int,
+        policy: RegistrationRetryPolicy,
+    ) -> str:
+        """建号后 token 缺失时，重走一次登录链路获取 token。"""
+        self._log_stage(RegistrationStage.RELAUNCH_LOGIN, attempt, "重启登录链路获取 token")
+        self._reset_auth_flow()
+        _, sentinel = self._prepare_authorize_flow(attempt)
+        self.signup(email, sentinel)
+        self._send_and_verify_otp_with_retry(mail_provider, email, attempt, policy)
+        workspace_id = self._extract_workspace_id()
+        if not workspace_id:
+            raise RuntimeError("重启登录后未获取 workspace_id")
+        continue_url = self._workspace_select(workspace_id)
+        if not continue_url:
+            raise RuntimeError("重启登录后 workspace/select 未返回 continue_url")
+        return continue_url
 
     @staticmethod
     def _is_tls_error(exc: Exception) -> bool:
@@ -460,44 +588,73 @@ class AuthFlow:
             logger.warning(f"Token 交换失败: {resp.status_code}")
 
     # ── 完整注册流程 ──
-    def run_register(self, mail_provider: MailProvider) -> AuthResult:
-        """执行完整注册流程"""
-        # 检查网络
+    def run_register(
+        self,
+        mail_provider: MailProvider,
+        policy: RegistrationRetryPolicy | None = None,
+    ) -> AuthResult:
+        """
+        执行完整注册流程（增强版）:
+        - 按阶段推进（precheck/email/authorize/otp/account/session）
+        - 失败时按策略重试
+        - token 获取失败时，重启登录链路回补一次
+        """
+        policy = policy or RegistrationRetryPolicy()
+        policy.max_flow_attempts = max(1, int(policy.max_flow_attempts))
+        policy.max_otp_attempts = max(1, int(policy.max_otp_attempts))
+        policy.max_session_attempts = max(1, int(policy.max_session_attempts))
+        policy.otp_wait_timeout = max(30, int(policy.otp_wait_timeout))
+        policy.retry_backoff_seconds = max(0.5, float(policy.retry_backoff_seconds))
+        last_error = ""
+
+        # 预检查失败不终止，只做告警
+        self._log_stage(RegistrationStage.PRECHECK, 1, "网络预检查")
         if not self.check_proxy():
             logger.warning("网络预检查未通过，继续尝试注册链路以获取精确错误...")
 
-        # 创建邮箱
-        email = mail_provider.create_mailbox()
-        self.result.email = email
+        for flow_try in range(1, policy.max_flow_attempts + 1):
+            try:
+                if flow_try > 1:
+                    self._reset_auth_flow()
+                    logger.warning(f"[注册] 进入第 {flow_try}/{policy.max_flow_attempts} 次全流程重试")
 
-        # 登录/注册链路
-        csrf_token = self.get_csrf_token()
-        auth_url = self.get_auth_url(csrf_token)
-        device_id = self.auth_oauth_init(auth_url)
-        sentinel = self.get_sentinel_token(device_id)
-        self.signup(email, sentinel)
-        self.send_otp()
+                self._log_stage(RegistrationStage.EMAIL_CREATE, flow_try, "创建临时邮箱")
+                email = mail_provider.create_mailbox()
+                self.result.email = email
 
-        # 等待 OTP
-        otp_code = mail_provider.wait_for_otp(email)
-        self.verify_otp(otp_code)
+                _, sentinel = self._prepare_authorize_flow(flow_try)
+                self.signup(email, sentinel)
+                self._send_and_verify_otp_with_retry(mail_provider, email, flow_try, policy)
 
-        # 创建账户 & 重定向
-        continue_url = self.create_account()
-        callback_url, final_url = self.follow_redirect_chain(continue_url)
+                self._log_stage(RegistrationStage.ACCOUNT_CREATE, flow_try, "创建账号并获取 continue_url")
+                continue_url = self.create_account()
 
-        # 获取 session
-        self.get_auth_session()
+                try:
+                    self._acquire_session_with_retry(continue_url, flow_try, policy)
+                except Exception as session_error:
+                    logger.warning(f"[注册][尝试{flow_try}] 首次 Session 获取失败: {session_error}")
+                    # 参考 codex-console2：建号后重启登录链路回补 token
+                    relogin_continue_url = self._restart_login_for_token(
+                        mail_provider, email, flow_try, policy
+                    )
+                    self._acquire_session_with_retry(relogin_continue_url, flow_try, policy)
 
-        # 可选 token 交换
-        if callback_url and continue_url:
-            self.oauth_token_exchange(callback_url, continue_url)
+                if not self.result.is_valid():
+                    raise RuntimeError("注册完成但未获取有效凭证")
 
-        if not self.result.is_valid():
-            raise RuntimeError("注册完成但未获取有效凭证")
+                self._log_stage(RegistrationStage.DONE, flow_try, "注册成功")
+                logger.info("注册流程完成!")
+                return self.result
+            except Exception as e:
+                last_error = str(e)
+                logger.error(f"[注册][尝试{flow_try}] 失败: {last_error}")
+                if flow_try < policy.max_flow_attempts:
+                    time.sleep(policy.retry_backoff_seconds * flow_try)
 
-        logger.info("注册流程完成!")
-        return self.result
+        stage = self._last_stage.value if self._last_stage else "unknown"
+        raise RuntimeError(
+            f"注册失败(已重试 {policy.max_flow_attempts} 次, 最后阶段: {stage}): {last_error}"
+        )
 
     # ── 从已有凭证初始化 ──
     def from_existing_credentials(

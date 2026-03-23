@@ -63,6 +63,50 @@ def init_db():
 
             CREATE INDEX IF NOT EXISTS idx_executions_code ON executions(code);
             CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status);
+
+            CREATE TABLE IF NOT EXISTS email_services (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                name             TEXT NOT NULL,
+                service_type     TEXT NOT NULL,
+                config_json      TEXT NOT NULL,
+                is_enabled       INTEGER NOT NULL DEFAULT 1,
+                priority         INTEGER NOT NULL DEFAULT 100,
+                last_test_status TEXT,
+                last_error       TEXT,
+                last_test_at     TEXT,
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_email_services_enabled_priority
+              ON email_services(is_enabled, priority, id);
+
+            CREATE TABLE IF NOT EXISTS proxies (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                name           TEXT NOT NULL,
+                proxy_type     TEXT NOT NULL DEFAULT 'http',
+                proxy_host     TEXT NOT NULL,
+                proxy_port     INTEGER NOT NULL,
+                username       TEXT,
+                password       TEXT,
+                is_enabled     INTEGER NOT NULL DEFAULT 1,
+                is_default     INTEGER NOT NULL DEFAULT 0,
+                priority       INTEGER NOT NULL DEFAULT 100,
+                last_used_at   TEXT,
+                created_at     TEXT NOT NULL,
+                updated_at     TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_proxies_enabled_priority
+              ON proxies(is_enabled, priority, id);
+            CREATE INDEX IF NOT EXISTS idx_proxies_default
+              ON proxies(is_default, id);
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key        TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
         """)
         # 自动迁移: 添加 reserved_amount 列 (如果不存在)
         try:

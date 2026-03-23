@@ -1,0 +1,17 @@
+services:
+  abcard:
+    image: ${GHCR_IMAGE:-ghcr.io/your-github-username/abcard-main:latest}
+    container_name: abcard
+    restart: unless-stopped
+    environment:
+      STREAMLIT_PORT: "${STREAMLIT_PORT:-8503}"
+      TZ: "${TZ:-Asia/Shanghai}"
+      ABC_DB_PATH: /app/runtime/data.db
+    ports:
+      - "${STREAMLIT_PORT:-8503}:${STREAMLIT_PORT:-8503}"
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./runtime:/app/runtime
+      - ./test_outputs:/app/test_outputs
+      - ./logs:/app/logs
+      - ./outputs:/app/outputs

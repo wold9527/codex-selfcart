@@ -1,0 +1,52 @@
+# 内部文档 (不随源码发布)
+实现文档.md
+兑换码系统文档.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.pytest_cache/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 测试输出 (包含敏感凭证)
+test_outputs/
+outputs/
+logs/
+*.log
+
+# 配置 (包含密钥)
+config.json
+
+# 数据库
+data.db
+data.db-wal
+data.db-shm
+
+# 开发测试脚本 (包含硬编码凭证)
+dev_tests/
+
+# 浏览器临时 profile
+.browser_profile/
+.browser_pay_profile/
+.uc_profile/
+
+# OS
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
+xray_client.json

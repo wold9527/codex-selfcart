@@ -1,0 +1,38 @@
+{
+  "mail": {
+    "worker_domain": "https://your-mail-worker.example.com",
+    "admin_token": "your-admin-token",
+    "email_domain": "your-domain.com"
+  },
+  "card": {
+    "number": "",
+    "cvc": "",
+    "exp_month": "",
+    "exp_year": ""
+  },
+  "billing": {
+    "name": "John Smith",
+    "email": "",
+    "country": "US",
+    "currency": "USD",
+    "address_line1": "123 Main St",
+    "address_state": "CA"
+  },
+  "team_plan": {
+    "plan_name": "chatgptteamplan",
+    "workspace_name": "MyWorkspace",
+    "price_interval": "month",
+    "seat_quantity": 5,
+    "promo_campaign_id": "team1dollar"
+  },
+  "captcha": {
+    "api_url": "https://api.yescaptcha.com",
+    "client_key": ""
+  },
+  "proxy": null,
+  "session_token": null,
+  "access_token": null,
+  "device_id": null,
+  "stripe_build_hash": "f197c9c0f0",
+  "code_system_enabled": false
+}
